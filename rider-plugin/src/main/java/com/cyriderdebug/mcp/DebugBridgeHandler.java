@@ -14,6 +14,7 @@ import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.search.FilenameIndex;
 import com.intellij.psi.search.GlobalSearchScope;
 import com.intellij.xdebugger.XDebugSession;
+import com.intellij.xdebugger.XDebugSessionListener;
 import com.intellij.xdebugger.XDebuggerManager;
 import com.intellij.xdebugger.XExpression;
 import com.intellij.xdebugger.XSourcePosition;
@@ -31,18 +32,37 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.ide.HttpRequestHandler;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.*;
-import java.util.regex.Pattern;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * REST API handler bridging MCP server to Rider's XDebugger.
  * Registers under /api/rider-debug-mcp/* via built-in HTTP server.
+ *
+ * Features:
+ *   - Breakpoint CRUD
+ *   - Debug session control (start/stop/step)
+ *   - Variable/stack inspection
+ *   - Event queue: captures breakpoint hits, pauses (assert), exceptions, exits
+ *   - Auto-resume policy: optionally auto-resume on assert/exception
  */
 public class DebugBridgeHandler extends HttpRequestHandler {
 
     private static final String PREFIX = "/api/rider-debug-mcp";
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
-    private static final Pattern BP_ID_PATTERN = Pattern.compile("/breakpoints/([^/]+)");
+    private static final int MAX_EVENTS = 200;
+
+    // --- Event queue (thread-safe, bounded) ---
+    private static final ConcurrentLinkedDeque<Map<String, Object>> EVENT_QUEUE = new ConcurrentLinkedDeque<>();
+
+    // --- Auto-resume policy ---
+    private static final AtomicBoolean AUTO_RESUME_ON_EXCEPTION = new AtomicBoolean(false);
+    private static final AtomicBoolean AUTO_COLLECT_ON_PAUSE = new AtomicBoolean(true);
+
+    // --- Track whether we've attached listener to current session ---
+    private static volatile XDebugSession lastTrackedSession = null;
 
     @Override
     public boolean isSupported(@NotNull FullHttpRequest request) {
@@ -99,15 +119,24 @@ public class DebugBridgeHandler extends HttpRequestHandler {
         if ("/debug/stackTrace".equals(path) && method == HttpMethod.GET) return getStackTrace();
         if ("/debug/threads".equals(path) && method == HttpMethod.GET) return getThreads();
 
+        // Events & policy
+        if ("/events".equals(path) && method == HttpMethod.GET) return pollEvents();
+        if ("/events/clear".equals(path) && method == HttpMethod.POST) return clearEvents();
+        if ("/debug/exceptionPolicy".equals(path) && method == HttpMethod.GET) return getExceptionPolicy();
+        if ("/debug/exceptionPolicy".equals(path) && method == HttpMethod.POST) return setExceptionPolicy(readBody(request));
+        if ("/debug/autoResume".equals(path) && method == HttpMethod.POST) return autoResume(readBody(request));
+
         return errorMap("Unknown endpoint: " + path);
     }
 
     // ==================== Status ====================
 
     private Map<String, Object> status() {
+        ensureSessionTracked();
+
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("plugin", "rider-debug-mcp");
-        map.put("version", "0.1.0");
+        map.put("version", "0.2.0");
 
         Project project = getProject();
         if (project == null) {
@@ -278,6 +307,13 @@ public class DebugBridgeHandler extends HttpRequestHandler {
             result.put("status", "starting");
             result.put("configuration", settings.getName());
         });
+
+        // Schedule listener attachment after a short delay (session needs time to start)
+        new Thread(() -> {
+            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            ensureSessionTracked();
+        }).start();
+
         return result;
     }
 
@@ -381,6 +417,180 @@ public class DebugBridgeHandler extends HttpRequestHandler {
                         "state", "suspended", "isMain", true)));
             } else {
                 result.put("threads", List.of());
+            }
+        });
+        return result;
+    }
+
+    // ==================== Events & Session Tracking ====================
+
+    /**
+     * Ensure we have a session listener attached to the current debug session.
+     * Called from status() and other entry points to lazily attach.
+     */
+    private void ensureSessionTracked() {
+        Project project = getProject();
+        if (project == null) return;
+
+        XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
+        if (session == null || session == lastTrackedSession) return;
+
+        lastTrackedSession = session;
+        session.addSessionListener(new XDebugSessionListener() {
+            @Override
+            public void sessionPaused() {
+                // This fires on breakpoint hit, assert, exception — any pause
+                Map<String, Object> event = new LinkedHashMap<>();
+                event.put("eventType", "paused");
+                event.put("timestamp", Instant.now().toString());
+
+                // Collect context
+                XStackFrame frame = session.getCurrentStackFrame();
+                XSourcePosition pos = frame != null ? frame.getSourcePosition() : null;
+                if (pos != null) {
+                    event.put("file", pos.getFile().getName());
+                    event.put("line", pos.getLine() + 1);
+                    event.put("filePath", pos.getFile().getPath());
+                }
+
+                // Check if this pause is at a known breakpoint location
+                boolean isAtBreakpoint = false;
+                if (pos != null) {
+                    Project proj = getProject();
+                    if (proj != null) {
+                        XBreakpointManager bpMgr = XDebuggerManager.getInstance(proj).getBreakpointManager();
+                        for (XBreakpoint<?> b : bpMgr.getAllBreakpoints()) {
+                            if (b instanceof XLineBreakpoint<?> lbp) {
+                                if (lbp.getFileUrl().endsWith(pos.getFile().getName())
+                                        && lbp.getLine() == pos.getLine()) {
+                                    isAtBreakpoint = true;
+                                    String fName = pos.getFile().getName();
+                                    event.put("reason", "breakpoint");
+                                    event.put("breakpointId", "bp-" + fName + ":" + (pos.getLine() + 1));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!isAtBreakpoint) {
+                    event.put("reason", "exception_or_assert");
+                    event.put("note", "Program paused (assert/exception/signal). Use /debug/stackTrace and /debug/resume or /debug/autoResume.");
+                }
+
+                pushEvent(event);
+
+                // Auto-resume if policy says so and it's an exception/assert
+                if (!isAtBreakpoint && AUTO_RESUME_ON_EXCEPTION.get()) {
+                    // Collect info first, then auto-resume
+                    Map<String, Object> autoEvent = new LinkedHashMap<>();
+                    autoEvent.put("eventType", "auto_resumed");
+                    autoEvent.put("timestamp", Instant.now().toString());
+                    autoEvent.put("reason", "auto_resume_policy");
+                    if (pos != null) {
+                        autoEvent.put("file", pos.getFile().getName());
+                        autoEvent.put("line", pos.getLine() + 1);
+                    }
+                    pushEvent(autoEvent);
+                    // Resume on a separate thread to not deadlock
+                    ApplicationManager.getApplication().invokeLater(session::resume);
+                }
+            }
+
+            @Override
+            public void sessionResumed() {
+                Map<String, Object> event = new LinkedHashMap<>();
+                event.put("eventType", "resumed");
+                event.put("timestamp", Instant.now().toString());
+                pushEvent(event);
+            }
+
+            @Override
+            public void sessionStopped() {
+                Map<String, Object> event = new LinkedHashMap<>();
+                event.put("eventType", "stopped");
+                event.put("timestamp", Instant.now().toString());
+                pushEvent(event);
+                lastTrackedSession = null;
+            }
+        });
+
+        // Record that we started tracking
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("eventType", "session_tracked");
+        event.put("timestamp", Instant.now().toString());
+        event.put("note", "Debug session listener attached. Events will be captured automatically.");
+        pushEvent(event);
+    }
+
+    private static void pushEvent(Map<String, Object> event) {
+        EVENT_QUEUE.addLast(event);
+        while (EVENT_QUEUE.size() > MAX_EVENTS) {
+            EVENT_QUEUE.pollFirst();
+        }
+    }
+
+    private Map<String, Object> pollEvents() {
+        ensureSessionTracked();
+        List<Map<String, Object>> events = new ArrayList<>();
+        Map<String, Object> event;
+        while ((event = EVENT_QUEUE.pollFirst()) != null) {
+            events.add(event);
+        }
+        return Map.of("events", events, "count", events.size());
+    }
+
+    private Map<String, Object> clearEvents() {
+        EVENT_QUEUE.clear();
+        return Map.of("cleared", true);
+    }
+
+    private Map<String, Object> getExceptionPolicy() {
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("autoResumeOnException", AUTO_RESUME_ON_EXCEPTION.get());
+        r.put("autoCollectOnPause", AUTO_COLLECT_ON_PAUSE.get());
+        r.put("description", "autoResumeOnException=true: program auto-resumes on assert/exception after collecting info. " +
+                "autoCollectOnPause=true: pause events include file/line info.");
+        return r;
+    }
+
+    private Map<String, Object> setExceptionPolicy(Map<String, Object> body) {
+        if (body.containsKey("autoResumeOnException")) {
+            AUTO_RESUME_ON_EXCEPTION.set(Boolean.TRUE.equals(body.get("autoResumeOnException")));
+        }
+        if (body.containsKey("autoCollectOnPause")) {
+            AUTO_COLLECT_ON_PAUSE.set(Boolean.TRUE.equals(body.get("autoCollectOnPause")));
+        }
+        return getExceptionPolicy();
+    }
+
+    private Map<String, Object> autoResume(Map<String, Object> body) {
+        // Convenience endpoint: resume current session + collect crash info
+        Project project = getProject();
+        if (project == null) return errorMap("No project");
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        runOnEdt(() -> {
+            XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
+            if (session == null) {
+                result.put("error", "No active debug session");
+                return;
+            }
+            // Collect info before resuming
+            XStackFrame frame = session.getCurrentStackFrame();
+            XSourcePosition pos = frame != null ? frame.getSourcePosition() : null;
+            if (pos != null) {
+                result.put("pausedAt", Map.of("file", pos.getFile().getName(), "line", pos.getLine() + 1));
+            }
+            result.put("wasPaused", session.isPaused());
+
+            // Resume
+            if (session.isPaused()) {
+                session.resume();
+                result.put("resumed", true);
+            } else {
+                result.put("resumed", false);
+                result.put("note", "Session was not paused");
             }
         });
         return result;
