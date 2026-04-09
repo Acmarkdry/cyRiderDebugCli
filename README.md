@@ -95,20 +95,7 @@ cyRiderDebugCli/
 
 - **Python 3.11+**
 - **JetBrains Rider** (running with built-in server enabled)
-- **Rider Debug API Bridge Plugin** — 必须安装配套的 Rider 插件来暴露调试 REST API（见 [`rider-plugin/`](rider-plugin/)）
-
-> ⚠️ **重要：** Rider 内置 HTTP Server 默认不暴露调试接口。需要安装 `rider-plugin/` 目录下的 Rider 插件，它会在 Rider 的内置 HTTP Server 上注册 `/api/debug/*` 端点，桥接到 XDebugger API。
-
-### Plugin Installation
-
-```bash
-# 构建 Rider 插件
-cd rider-plugin
-./gradlew buildPlugin
-
-# 产物: rider-plugin/build/distributions/rider-debug-api-*.zip
-# 在 Rider 中: Settings → Plugins → ⚙ → Install Plugin from Disk → 选择 zip
-```
+> 💡 **无需安装任何 Rider 插件！** 本项目使用 JetBrains 内置 HTTP Server 的原生端点（`/api/internal/executeAction`、`/api/internal/runScript`），直接与 Rider 调试器交互。只需在 Rider 中启用 **Allow unsigned requests**（Settings → Build → Debugger）。
 
 ### Installation
 
