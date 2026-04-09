@@ -95,7 +95,18 @@ cyRiderDebugCli/
 
 - **Python 3.11+**
 - **JetBrains Rider** (running with built-in server enabled)
-> 💡 **无需安装任何 Rider 插件！** 本项目使用 JetBrains 内置 HTTP Server 的原生端点（`/api/internal/executeAction`、`/api/internal/runScript`），直接与 Rider 调试器交互。只需在 Rider 中启用 **Allow unsigned requests**（Settings → Build → Debugger）。
+- **Rider Debug MCP Plugin** — 配套 Rider 插件（一键安装）
+
+### Plugin Installation (One-Click)
+
+```bash
+# 自动检测 Rider 并安装插件
+python install_plugin.py
+
+# 重启 Rider 即可使用
+```
+
+> 💡 插件通过 Rider 内置 HTTP Server 的扩展点注册 `/api/rider-debug-mcp/*` 端点，桥接到 XDebuggerManager API。安装后无需任何配置。
 
 ### Installation
 

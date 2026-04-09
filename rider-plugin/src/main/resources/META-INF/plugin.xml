@@ -1,0 +1,14 @@
+<idea-plugin>
+    <id>com.cyriderdebug.mcp</id>
+    <name>Rider Debug MCP Bridge</name>
+    <version>0.1.0</version>
+    <vendor url="https://github.com/Acmarkdry/cyRiderDebugCli">cyRiderDebugCli</vendor>
+    <description><![CDATA[
+        Exposes Rider debugger as REST API for MCP server integration.
+        Endpoints: /api/rider-debug-mcp/*
+    ]]></description>
+    <depends>com.intellij.modules.rider</depends>
+    <extensions defaultExtensionNs="com.intellij">
+        <httpRequestHandler implementation="com.cyriderdebug.mcp.DebugBridgeHandler"/>
+    </extensions>
+</idea-plugin>
