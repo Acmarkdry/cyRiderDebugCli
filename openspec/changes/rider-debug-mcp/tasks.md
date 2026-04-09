@@ -74,16 +74,16 @@
 
 - [x] 10.1 Implement help system: command registry with descriptions, syntax, parameter info, examples; `help` lists all commands grouped by domain; `help <command>` shows detailed help
 - [x] 10.2 Create `tests/conftest.py` with shared fixtures: mock RiderClient, mock session, sample data factories
-- [ ] 10.3 Run full test suite and verify all tests pass
+- [x] 10.3 Run full test suite and verify all tests pass
 
 ## 11. CI/CD & GitHub Actions
 
 - [x] 11.1 Create `.github/workflows/ci.yml`: trigger on push to main + PRs, matrix (Python 3.11, 3.12), steps: checkout → setup-python → install deps → ruff check → pytest --cov → coverage report
 - [x] 11.2 Add ruff configuration in `pyproject.toml` (line length, target Python version, select rules)
-- [ ] 11.3 Verify CI workflow passes locally with `ruff check` and `pytest`
+- [x] 11.3 Verify CI workflow passes locally with `ruff check` and `pytest`
 
 ## 12. Documentation & Finalization
 
 - [x] 12.1 Update `README.md` with complete CLI command reference table, MCP configuration example (for Claude/Cursor), and architecture diagram
 - [x] 12.2 Add MCP client configuration example (JSON snippet for adding this server to MCP settings)
-- [ ] 12.3 Create initial git commit with conventional commit message
+- [x] 12.3 Create initial git commit with conventional commit message
