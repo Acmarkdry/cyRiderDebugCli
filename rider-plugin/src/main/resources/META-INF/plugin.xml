@@ -1,0 +1,36 @@
+<idea-plugin>
+    <id>com.cyriderdebug.rider-debug-api</id>
+    <name>Rider Debug API Bridge</name>
+    <version>0.1.0</version>
+    <vendor>cyRiderDebugCli</vendor>
+
+    <description><![CDATA[
+        Exposes Rider debugger operations via the built-in HTTP server REST API.
+        Designed to work with the rider-debug-mcp MCP server.
+
+        Endpoints exposed:
+        <ul>
+            <li>POST /api/debug/breakpoints - Add breakpoint</li>
+            <li>GET  /api/debug/breakpoints - List breakpoints</li>
+            <li>DELETE /api/debug/breakpoints/{id} - Remove breakpoint</li>
+            <li>POST /api/debug/start - Start debug session</li>
+            <li>POST /api/debug/stop - Stop debug session</li>
+            <li>POST /api/debug/pause - Pause execution</li>
+            <li>POST /api/debug/resume - Resume execution</li>
+            <li>POST /api/debug/stepOver - Step over</li>
+            <li>POST /api/debug/stepInto - Step into</li>
+            <li>POST /api/debug/stepOut - Step out</li>
+            <li>GET  /api/debug/variables - Get local variables</li>
+            <li>POST /api/debug/evaluate - Evaluate expression</li>
+            <li>GET  /api/debug/stackTrace - Get stack trace</li>
+            <li>GET  /api/debug/threads - Get thread list</li>
+        </ul>
+    ]]></description>
+
+    <depends>com.intellij.modules.rider</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <httpRequestHandler
+            implementation="com.cyriderdebug.api.DebugApiHandler"/>
+    </extensions>
+</idea-plugin>
