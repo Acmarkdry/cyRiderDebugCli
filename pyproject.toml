@@ -13,7 +13,6 @@ authors = [
     { name = "Acmarkdry", email = "acmarkdry@users.noreply.github.com" },
 ]
 keywords = ["mcp", "rider", "debugger", "jetbrains", "dotnet", "csharp", "unity", "debug"]
-
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3.11",
@@ -21,12 +20,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Topic :: Software Development :: Debuggers",
 ]
-
-[project.urls]
-Homepage = "https://github.com/Acmarkdry/cyRiderDebugCli"
-Repository = "https://github.com/Acmarkdry/cyRiderDebugCli"
-Issues = "https://github.com/Acmarkdry/cyRiderDebugCli/issues"
-
 dependencies = [
     "mcp>=1.0.0",
     "httpx>=0.27.0",
@@ -41,6 +34,11 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.4.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Acmarkdry/cyRiderDebugCli"
+Repository = "https://github.com/Acmarkdry/cyRiderDebugCli"
+Issues = "https://github.com/Acmarkdry/cyRiderDebugCli/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rider_debug_mcp"]
