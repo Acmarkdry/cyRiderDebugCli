@@ -34,6 +34,7 @@ import org.jetbrains.ide.HttpRequestHandler;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
+import java.util.Collections;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -348,78 +349,83 @@ public class DebugBridgeHandler extends HttpRequestHandler {
 
     /**
      * GET /debug/variables — enumerate XValue children from the current stack frame.
-     * Uses XStackFrame.computeChildren() with a CountDownLatch for sync wait.
+     *
+     * IMPORTANT: computeChildren/computePresentation callbacks fire on a pooled thread,
+     * NOT on EDT. We must NOT call latch.await() on EDT (deadlock). So we grab the
+     * frame reference on EDT, then do the async work + await on the caller (Netty) thread.
      */
     private Map<String, Object> getVariables() {
         Project project = getProject();
         if (project == null) return Map.of("variables", List.of());
 
         Map<String, Object> result = new LinkedHashMap<>();
+
+        // Step 1: grab frame reference on EDT
+        final XStackFrame[] frameRef = {null};
         runOnEdt(() -> {
             XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
             if (session == null) { result.put("error", "No debug session"); return; }
             XStackFrame frame = session.getCurrentStackFrame();
             if (frame == null) { result.put("error", "No stack frame"); return; }
+            frameRef[0] = frame;
 
             XSourcePosition pos = frame.getSourcePosition();
             if (pos != null) {
                 result.put("frame", Map.of("file", pos.getFile().getName(), "line", pos.getLine() + 1));
             }
-
-            // Compute children asynchronously and wait
-            List<Map<String, Object>> vars = new ArrayList<>();
-            var latch = new java.util.concurrent.CountDownLatch(1);
-
-            frame.computeChildren(new com.intellij.xdebugger.frame.XCompositeNode() {
-                @Override
-                public void addChildren(@NotNull com.intellij.xdebugger.frame.XValueChildrenList children, boolean last) {
-                    for (int i = 0; i < children.size(); i++) {
-                        String name = children.getName(i);
-                        com.intellij.xdebugger.frame.XValue xval = children.getValue(i);
-                        Map<String, Object> varInfo = new LinkedHashMap<>();
-                        varInfo.put("name", name);
-                        collectXValuePresentation(xval, varInfo);
-                        vars.add(varInfo);
-                    }
-                    if (last) latch.countDown();
-                }
-
-                @Override
-                public void tooManyChildren(int remaining) {
-                    vars.add(Map.of("name", "...", "value", remaining + " more children", "type", "overflow"));
-                    latch.countDown();
-                }
-
-                @Override
-                public void setAlreadySorted(boolean alreadySorted) {}
-
-                @Override
-                public void setErrorMessage(@NotNull String errorMessage) {
-                    vars.add(Map.of("name", "__error__", "value", errorMessage, "type", "error"));
-                    latch.countDown();
-                }
-
-                @Override
-                public void setErrorMessage(@NotNull String errorMessage, @org.jetbrains.annotations.Nullable com.intellij.xdebugger.frame.XDebuggerTreeNodeHyperlink link) {
-                    setErrorMessage(errorMessage);
-                }
-
-                @Override
-                public void setMessage(@NotNull String message, @org.jetbrains.annotations.Nullable javax.swing.Icon icon,
-                                       @NotNull com.intellij.ui.SimpleTextAttributes attributes,
-                                       @org.jetbrains.annotations.Nullable com.intellij.xdebugger.frame.XDebuggerTreeNodeHyperlink link) {
-                    // Message display, e.g. "Loading..."
-                }
-
-                @Override
-                public boolean isObsolete() { return false; }
-            });
-
-            try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
-            catch (InterruptedException ignored) {}
-
-            result.put("variables", vars);
         });
+
+        if (frameRef[0] == null) return result.isEmpty() ? Map.of("error", "No stack frame") : result;
+
+        // Step 2: compute children on the current (Netty) thread — callbacks come on a pooled thread
+        List<Map<String, Object>> vars = Collections.synchronizedList(new ArrayList<>());
+        var latch = new java.util.concurrent.CountDownLatch(1);
+
+        frameRef[0].computeChildren(new com.intellij.xdebugger.frame.XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull com.intellij.xdebugger.frame.XValueChildrenList children, boolean last) {
+                for (int i = 0; i < children.size(); i++) {
+                    String name = children.getName(i);
+                    com.intellij.xdebugger.frame.XValue xval = children.getValue(i);
+                    Map<String, Object> varInfo = new LinkedHashMap<>();
+                    varInfo.put("name", name);
+                    collectXValuePresentation(xval, varInfo);
+                    vars.add(varInfo);
+                }
+                if (last) latch.countDown();
+            }
+
+            @Override
+            public void tooManyChildren(int remaining) {
+                vars.add(Map.of("name", "...", "value", remaining + " more children", "type", "overflow"));
+                latch.countDown();
+            }
+
+            @Override public void setAlreadySorted(boolean alreadySorted) {}
+
+            @Override
+            public void setErrorMessage(@NotNull String errorMessage) {
+                vars.add(Map.of("name", "__error__", "value", errorMessage, "type", "error"));
+                latch.countDown();
+            }
+
+            @Override
+            public void setErrorMessage(@NotNull String errorMessage, @org.jetbrains.annotations.Nullable com.intellij.xdebugger.frame.XDebuggerTreeNodeHyperlink link) {
+                setErrorMessage(errorMessage);
+            }
+
+            @Override
+            public void setMessage(@NotNull String message, @org.jetbrains.annotations.Nullable javax.swing.Icon icon,
+                                   @NotNull com.intellij.ui.SimpleTextAttributes attributes,
+                                   @org.jetbrains.annotations.Nullable com.intellij.xdebugger.frame.XDebuggerTreeNodeHyperlink link) {}
+
+            @Override public boolean isObsolete() { return false; }
+        });
+
+        try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
+        catch (InterruptedException ignored) {}
+
+        result.put("variables", vars);
         return result;
     }
 
@@ -506,50 +512,53 @@ public class DebugBridgeHandler extends HttpRequestHandler {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("expression", expr);
 
+        // Step 1: grab evaluator on EDT
+        final com.intellij.xdebugger.evaluation.XDebuggerEvaluator[] evalRef = {null};
         runOnEdt(() -> {
             XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
             if (session == null) { result.put("error", "No debug session"); return; }
             XStackFrame frame = session.getCurrentStackFrame();
             if (frame == null) { result.put("error", "No stack frame"); return; }
-
-            com.intellij.xdebugger.evaluation.XDebuggerEvaluator evaluator = frame.getEvaluator();
-            if (evaluator == null) { result.put("error", "No evaluator available for this frame"); return; }
-
-            var latch = new java.util.concurrent.CountDownLatch(1);
-
-            try {
-                com.intellij.xdebugger.impl.breakpoints.XExpressionImpl expression =
-                    com.intellij.xdebugger.impl.breakpoints.XExpressionImpl.fromText(expr);
-
-                evaluator.evaluate(expression, new com.intellij.xdebugger.evaluation.XDebuggerEvaluator.XEvaluationCallback() {
-                    @Override
-                    public void evaluated(@NotNull com.intellij.xdebugger.frame.XValue xval) {
-                        collectXValuePresentation(xval, result);
-                        result.put("status", "evaluated");
-                        latch.countDown();
-                    }
-
-                    @Override
-                    public void errorOccurred(@NotNull String errorMessage) {
-                        result.put("error", errorMessage);
-                        result.put("status", "error");
-                        latch.countDown();
-                    }
-                }, null);
-            } catch (Exception e) {
-                result.put("error", "Evaluation failed: " + e.getMessage());
-                result.put("status", "error");
-                latch.countDown();
-            }
-
-            try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
-            catch (InterruptedException ignored) {}
-
-            if (!result.containsKey("status")) {
-                result.put("status", "timeout");
-                result.put("note", "Evaluation timed out after " + ASYNC_TIMEOUT_MS + "ms");
-            }
+            evalRef[0] = frame.getEvaluator();
+            if (evalRef[0] == null) { result.put("error", "No evaluator available"); }
         });
+
+        if (evalRef[0] == null) return result;
+
+        // Step 2: evaluate on Netty thread, await callback
+        var latch = new java.util.concurrent.CountDownLatch(1);
+        try {
+            com.intellij.xdebugger.impl.breakpoints.XExpressionImpl expression =
+                com.intellij.xdebugger.impl.breakpoints.XExpressionImpl.fromText(expr);
+
+            evalRef[0].evaluate(expression, new com.intellij.xdebugger.evaluation.XDebuggerEvaluator.XEvaluationCallback() {
+                @Override
+                public void evaluated(@NotNull com.intellij.xdebugger.frame.XValue xval) {
+                    collectXValuePresentation(xval, result);
+                    result.put("status", "evaluated");
+                    latch.countDown();
+                }
+
+                @Override
+                public void errorOccurred(@NotNull String errorMessage) {
+                    result.put("error", errorMessage);
+                    result.put("status", "error");
+                    latch.countDown();
+                }
+            }, null);
+        } catch (Exception e) {
+            result.put("error", "Evaluation failed: " + e.getMessage());
+            result.put("status", "error");
+            return result;
+        }
+
+        try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
+        catch (InterruptedException ignored) {}
+
+        if (!result.containsKey("status")) {
+            result.put("status", "timeout");
+            result.put("note", "Evaluation timed out after " + ASYNC_TIMEOUT_MS + "ms");
+        }
         return result;
     }
 
@@ -562,6 +571,10 @@ public class DebugBridgeHandler extends HttpRequestHandler {
         if (project == null) return Map.of("frames", List.of());
 
         Map<String, Object> result = new LinkedHashMap<>();
+
+        // Step 1: grab execution stack on EDT
+        final XExecutionStack[] stackRef = {null};
+        final XStackFrame[] topFrameRef = {null};
         runOnEdt(() -> {
             XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
             if (session == null) { result.put("error", "No debug session"); return; }
@@ -569,63 +582,61 @@ public class DebugBridgeHandler extends HttpRequestHandler {
             XSuspendContext ctx = session.getSuspendContext();
             if (ctx == null) { result.put("error", "Not suspended"); return; }
 
-            XExecutionStack activeStack = ctx.getActiveExecutionStack();
-            if (activeStack == null) { result.put("error", "No active execution stack"); return; }
+            stackRef[0] = ctx.getActiveExecutionStack();
+            if (stackRef[0] == null) { result.put("error", "No active execution stack"); return; }
 
-            List<Map<String, Object>> frames = new ArrayList<>();
-            var latch = new java.util.concurrent.CountDownLatch(1);
+            topFrameRef[0] = stackRef[0].getTopFrame();
+            result.put("threadName", stackRef[0].getDisplayName());
+        });
 
-            // First add the top frame if available
-            XStackFrame topFrame = activeStack.getTopFrame();
+        if (stackRef[0] == null) return result;
 
-            activeStack.computeStackFrames(0, new XExecutionStack.XStackFrameContainer() {
-                @Override
-                public void addStackFrames(@NotNull List<? extends XStackFrame> stackFrames, boolean last) {
-                    for (XStackFrame sf : stackFrames) {
-                        Map<String, Object> frameInfo = new LinkedHashMap<>();
-                        XSourcePosition sfPos = sf.getSourcePosition();
-                        if (sfPos != null) {
-                            frameInfo.put("file", sfPos.getFile().getName());
-                            frameInfo.put("line", sfPos.getLine() + 1);
-                            frameInfo.put("filePath", sfPos.getFile().getPath());
-                        }
+        // Step 2: compute all frames on Netty thread
+        List<Map<String, Object>> frames = Collections.synchronizedList(new ArrayList<>());
+        var latch = new java.util.concurrent.CountDownLatch(1);
 
-                        // Try to get the function name from the custom name (via toString or presentation)
-                        String displayName = extractFrameDisplayName(sf);
-                        frameInfo.put("method", displayName);
-                        frameInfo.put("index", frames.size());
-
-                        frames.add(frameInfo);
+        stackRef[0].computeStackFrames(0, new XExecutionStack.XStackFrameContainer() {
+            @Override
+            public void addStackFrames(@NotNull List<? extends XStackFrame> stackFrames, boolean last) {
+                for (XStackFrame sf : stackFrames) {
+                    Map<String, Object> frameInfo = new LinkedHashMap<>();
+                    XSourcePosition sfPos = sf.getSourcePosition();
+                    if (sfPos != null) {
+                        frameInfo.put("file", sfPos.getFile().getName());
+                        frameInfo.put("line", sfPos.getLine() + 1);
+                        frameInfo.put("filePath", sfPos.getFile().getPath());
                     }
-                    if (last) latch.countDown();
+                    frameInfo.put("method", extractFrameDisplayName(sf));
+                    frameInfo.put("index", frames.size());
+                    frames.add(frameInfo);
                 }
-
-                @Override
-                public void errorOccurred(@NotNull String errorMessage) {
-                    frames.add(Map.of("error", errorMessage));
-                    latch.countDown();
-                }
-            });
-
-            try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
-            catch (InterruptedException ignored) {}
-
-            // If computeStackFrames returned nothing, at least include top frame
-            if (frames.isEmpty() && topFrame != null) {
-                XSourcePosition topPos = topFrame.getSourcePosition();
-                Map<String, Object> fallback = new LinkedHashMap<>();
-                if (topPos != null) {
-                    fallback.put("file", topPos.getFile().getName());
-                    fallback.put("line", topPos.getLine() + 1);
-                }
-                fallback.put("method", extractFrameDisplayName(topFrame));
-                fallback.put("index", 0);
-                frames.add(fallback);
+                if (last) latch.countDown();
             }
 
-            result.put("frames", frames);
-            result.put("threadName", activeStack.getDisplayName());
+            @Override
+            public void errorOccurred(@NotNull String errorMessage) {
+                frames.add(Map.of("error", errorMessage));
+                latch.countDown();
+            }
         });
+
+        try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
+        catch (InterruptedException ignored) {}
+
+        // Fallback if computeStackFrames returned nothing
+        if (frames.isEmpty() && topFrameRef[0] != null) {
+            XSourcePosition topPos = topFrameRef[0].getSourcePosition();
+            Map<String, Object> fallback = new LinkedHashMap<>();
+            if (topPos != null) {
+                fallback.put("file", topPos.getFile().getName());
+                fallback.put("line", topPos.getLine() + 1);
+            }
+            fallback.put("method", extractFrameDisplayName(topFrameRef[0]));
+            fallback.put("index", 0);
+            frames.add(fallback);
+        }
+
+        result.put("frames", frames);
         return result;
     }
 
