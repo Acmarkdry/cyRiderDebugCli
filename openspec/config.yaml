@@ -1,0 +1,24 @@
+schema: spec-driven
+
+# Project context
+context: |
+  Project: cyRiderDebugCli - A Rider IDE MCP (Model Context Protocol) debugging tool
+  Tech stack: Python 3.11+, MCP SDK, JetBrains Rider Gateway API
+  Architecture: MCP Server (cli + query interface) + Middleware Analysis Layer
+  Pattern: Similar to UE MCP tool - simple cli/query interface with intelligent middleware
+  CI/CD: GitHub Actions for unit testing
+  Testing: pytest
+  We use conventional commits
+  Domain: IDE debugging, breakpoint management, crash analysis
+
+# Per-artifact rules
+rules:
+  proposal:
+    - Keep proposals focused on the MCP tool architecture
+    - Always reference the cli/query dual-interface pattern
+  design:
+    - Include middleware layer design details
+    - Cover MCP protocol compliance
+  tasks:
+    - Break tasks into implementable chunks
+    - Include CI/CD setup tasks
