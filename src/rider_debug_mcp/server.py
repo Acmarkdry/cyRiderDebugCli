@@ -85,10 +85,137 @@ QUERIES:
 
 
 def _format_result(data: Any) -> str:
-    """Format a result for MCP text output."""
+    """Format a result for human-readable CLI text output."""
     if isinstance(data, str):
         return data
-    return json.dumps(data, indent=2, default=str)
+    if isinstance(data, list):
+        return _format_list(data)
+    if isinstance(data, dict):
+        return _format_dict(data)
+    return str(data)
+
+
+def _format_list(items: list[Any]) -> str:
+    """Format a list of items as CLI-readable text."""
+    if not items:
+        return "(empty)"
+    # Detect list type by first item
+    first = items[0]
+    if isinstance(first, dict):
+        # Check for known shapes
+        if "method_name" in first or "method" in first:
+            return _format_stack_frames(items)
+        if "name" in first and "value" in first:
+            return _format_variables(items)
+        if "thread_id" in first or "id" in first and "state" in first:
+            return _format_threads(items)
+        if "file" in first and "line" in first and "id" in first:
+            return _format_breakpoints(items)
+    # Generic list
+    lines = []
+    for i, item in enumerate(items):
+        if isinstance(item, dict):
+            lines.append(f"  [{i}] {_format_dict_inline(item)}")
+        else:
+            lines.append(f"  [{i}] {item}")
+    return "\n".join(lines)
+
+
+def _format_dict(d: dict[str, Any]) -> str:
+    """Format a dict as CLI key-value pairs."""
+    if not d:
+        return "(empty)"
+    # Known dict shapes
+    if "expression" in d and ("value" in d or "result" in d or "status" in d):
+        return _format_eval_result(d)
+    # Generic dict
+    lines = []
+    max_key = max(len(str(k)) for k in d) if d else 0
+    for k, v in d.items():
+        if isinstance(v, (dict, list)):
+            lines.append(f"  {k:<{max_key}}  {json.dumps(v, default=str)}")
+        else:
+            lines.append(f"  {k:<{max_key}}  {v}")
+    return "\n".join(lines)
+
+
+def _format_dict_inline(d: dict[str, Any]) -> str:
+    """Format a dict on a single line."""
+    parts = [f"{k}={v}" for k, v in d.items() if v is not None]
+    return ", ".join(parts)
+
+
+def _format_stack_frames(frames: list[dict[str, Any]]) -> str:
+    """Format stack trace as a readable call stack."""
+    lines = []
+    for i, f in enumerate(frames):
+        method = f.get("method_name") or f.get("method") or "??"
+        file = f.get("file") or "??"
+        line = f.get("line", "?")
+        module = f.get("module") or ""
+        prefix = "→ " if i == 0 else "  "
+        loc = f"{file}:{line}"
+        if module:
+            loc += f"  [{module}]"
+        lines.append(f"  {prefix}#{i:<3} {method}")
+        lines.append(f"         at {loc}")
+    return "\n".join(lines)
+
+
+def _format_variables(variables: list[dict[str, Any]]) -> str:
+    """Format variables as name = value (type)."""
+    if not variables:
+        return "(no variables)"
+    lines = []
+    max_name = max(len(v.get("name", "")) for v in variables)
+    for v in variables:
+        name = v.get("name", "?")
+        value = v.get("value", "??")
+        typ = v.get("type_name") or v.get("type") or ""
+        children = " [+]" if v.get("has_children") or v.get("hasChildren") else ""
+        type_str = f"  ({typ})" if typ else ""
+        lines.append(f"  {name:<{max_name}}  = {value}{type_str}{children}")
+    return "\n".join(lines)
+
+
+def _format_threads(threads: list[dict[str, Any]]) -> str:
+    """Format thread list."""
+    lines = []
+    for t in threads:
+        tid = t.get("thread_id") or t.get("id", "?")
+        name = t.get("name") or "unnamed"
+        state = t.get("state", "unknown")
+        main = " (main)" if t.get("is_main") or t.get("isMain") else ""
+        lines.append(f"  [{tid}] {name} — {state}{main}")
+    return "\n".join(lines)
+
+
+def _format_breakpoints(breakpoints: list[dict[str, Any]]) -> str:
+    """Format breakpoint list."""
+    lines = []
+    for bp in breakpoints:
+        bp_id = bp.get("id", "?")
+        file = bp.get("file", "?")
+        line = bp.get("line", "?")
+        enabled = "✓" if bp.get("enabled", True) else "✗"
+        cond = bp.get("condition")
+        cond_str = f"  when {cond}" if cond else ""
+        lines.append(f"  {enabled} {bp_id}  {file}:{line}{cond_str}")
+    return "\n".join(lines)
+
+
+def _format_eval_result(d: dict[str, Any]) -> str:
+    """Format expression evaluation result."""
+    expr = d.get("expression", "?")
+    status = d.get("status", "?")
+    value = d.get("value") or d.get("result") or ""
+    typ = d.get("type") or d.get("type_name") or ""
+    error = d.get("error")
+
+    if error:
+        return f"  {expr}  →  error: {error}"
+    type_str = f"  ({typ})" if typ else ""
+    return f"  {expr}  =  {value}{type_str}  [{status}]"
 
 
 class RiderMCPServer:
