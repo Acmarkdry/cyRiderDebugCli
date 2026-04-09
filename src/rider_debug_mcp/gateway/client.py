@@ -74,7 +74,10 @@ class RiderClient:
         """Connect to Rider IDE. Auto-discovers port if not specified."""
         if self._port is not None:
             self._base_url = f"http://{self._host}:{self._port}"
-            self._client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url, timeout=self._timeout,
+                headers={"Origin": f"http://{self._host}:{self._port}"},
+            )
             if not await self._check_connection():
                 await self._client.aclose()
                 self._client = None
@@ -87,7 +90,10 @@ class RiderClient:
 
         for port in range(DEFAULT_PORT_RANGE_START, DEFAULT_PORT_RANGE_END + 1):
             base_url = f"http://{self._host}:{port}"
-            client = httpx.AsyncClient(base_url=base_url, timeout=self._timeout)
+            client = httpx.AsyncClient(
+                base_url=base_url, timeout=self._timeout,
+                headers={"Origin": base_url},
+            )
             try:
                 resp = await client.get("/api/about")
                 if resp.status_code == 200:
