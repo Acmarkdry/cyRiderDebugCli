@@ -342,8 +342,14 @@ public class DebugBridgeHandler extends HttpRequestHandler {
         return result;
     }
 
-    // ==================== Inspection ====================
+    // ==================== Inspection (deep XDebugger API access) ====================
 
+    private static final long ASYNC_TIMEOUT_MS = 5000;
+
+    /**
+     * GET /debug/variables — enumerate XValue children from the current stack frame.
+     * Uses XStackFrame.computeChildren() with a CountDownLatch for sync wait.
+     */
     private Map<String, Object> getVariables() {
         Project project = getProject();
         if (project == null) return Map.of("variables", List.of());
@@ -354,26 +360,203 @@ public class DebugBridgeHandler extends HttpRequestHandler {
             if (session == null) { result.put("error", "No debug session"); return; }
             XStackFrame frame = session.getCurrentStackFrame();
             if (frame == null) { result.put("error", "No stack frame"); return; }
+
             XSourcePosition pos = frame.getSourcePosition();
-            result.put("variables", List.of());
             if (pos != null) {
                 result.put("frame", Map.of("file", pos.getFile().getName(), "line", pos.getLine() + 1));
             }
-            result.put("note", "Variable values visible in Rider's Variables panel");
+
+            // Compute children asynchronously and wait
+            List<Map<String, Object>> vars = new ArrayList<>();
+            var latch = new java.util.concurrent.CountDownLatch(1);
+
+            frame.computeChildren(new com.intellij.xdebugger.frame.XCompositeNode() {
+                @Override
+                public void addChildren(@NotNull com.intellij.xdebugger.frame.XValueChildrenList children, boolean last) {
+                    for (int i = 0; i < children.size(); i++) {
+                        String name = children.getName(i);
+                        com.intellij.xdebugger.frame.XValue xval = children.getValue(i);
+                        Map<String, Object> varInfo = new LinkedHashMap<>();
+                        varInfo.put("name", name);
+                        collectXValuePresentation(xval, varInfo);
+                        vars.add(varInfo);
+                    }
+                    if (last) latch.countDown();
+                }
+
+                @Override
+                public void tooManyChildren(int remaining) {
+                    vars.add(Map.of("name", "...", "value", remaining + " more children", "type", "overflow"));
+                    latch.countDown();
+                }
+
+                @Override
+                public void setAlreadySorted(boolean alreadySorted) {}
+
+                @Override
+                public void setErrorMessage(@NotNull String errorMessage) {
+                    vars.add(Map.of("name", "__error__", "value", errorMessage, "type", "error"));
+                    latch.countDown();
+                }
+
+                @Override
+                public void setErrorMessage(@NotNull String errorMessage, @org.jetbrains.annotations.Nullable com.intellij.xdebugger.frame.XDebuggerTreeNodeHyperlink link) {
+                    setErrorMessage(errorMessage);
+                }
+
+                @Override
+                public void setMessage(@NotNull String message, @org.jetbrains.annotations.Nullable javax.swing.Icon icon,
+                                       @NotNull com.intellij.ui.SimpleTextAttributes attributes,
+                                       @org.jetbrains.annotations.Nullable com.intellij.xdebugger.frame.XDebuggerTreeNodeHyperlink link) {
+                    // Message display, e.g. "Loading..."
+                }
+
+                @Override
+                public boolean isObsolete() { return false; }
+            });
+
+            try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
+            catch (InterruptedException ignored) {}
+
+            result.put("variables", vars);
         });
         return result;
     }
 
+    /**
+     * Collect value + type from XValue's presentation callback.
+     * This uses computePresentation() with a sync latch.
+     */
+    private static void collectXValuePresentation(com.intellij.xdebugger.frame.XValue xval, Map<String, Object> target) {
+        var latch = new java.util.concurrent.CountDownLatch(1);
+        final String[] collected = {"", "", "false"};
+
+        xval.computePresentation(new com.intellij.xdebugger.frame.XValueNode() {
+            @Override
+            public void setPresentation(@org.jetbrains.annotations.Nullable javax.swing.Icon icon,
+                                        @org.jetbrains.annotations.Nullable String type,
+                                        @NotNull String value, boolean hasChildren) {
+                collected[0] = value;
+                collected[1] = type != null ? type : "";
+                collected[2] = String.valueOf(hasChildren);
+                latch.countDown();
+            }
+
+            @Override
+            public void setPresentation(@org.jetbrains.annotations.Nullable javax.swing.Icon icon,
+                                        @NotNull com.intellij.xdebugger.frame.presentation.XValuePresentation presentation,
+                                        boolean hasChildren) {
+                collected[0] = presentation.getSeparator() != null ? presentation.getSeparator() : "";
+                collected[1] = presentation.getType() != null ? presentation.getType() : "";
+                collected[2] = String.valueOf(hasChildren);
+                // Try to get the rendered text
+                var sb = new StringBuilder();
+                presentation.renderValue(new com.intellij.xdebugger.frame.presentation.XValuePresentation.XValueTextRenderer() {
+                    @Override
+                    public void renderValue(@NotNull String value) { sb.append(value); }
+                    @Override
+                    public void renderStringValue(@NotNull String value) { sb.append('"').append(value).append('"'); }
+                    @Override
+                    public void renderStringValue(@NotNull String value, @org.jetbrains.annotations.Nullable String additionalSpecialCharsToHighlight, int maxLength) {
+                        sb.append('"').append(value).append('"');
+                    }
+                    @Override
+                    public void renderNumericValue(@NotNull String value) { sb.append(value); }
+                    @Override
+                    public void renderKeywordValue(@NotNull String value) { sb.append(value); }
+                    @Override
+                    public void renderComment(@NotNull String comment) { sb.append(" /* ").append(comment).append(" */"); }
+                    @Override
+                    public void renderSpecialSymbol(@NotNull String symbol) { sb.append(symbol); }
+                    @Override
+                    public void renderError(@NotNull String error) { sb.append("[error: ").append(error).append("]"); }
+                    @Override
+                    public void renderValue(@NotNull String value, @NotNull com.intellij.openapi.editor.colors.TextAttributesKey key) { sb.append(value); }
+                });
+                if (!sb.isEmpty()) collected[0] = sb.toString();
+                latch.countDown();
+            }
+
+            @Override
+            public void setFullValueEvaluator(@NotNull com.intellij.xdebugger.frame.XFullValueEvaluator fullValueEvaluator) {}
+
+            @Override
+            public boolean isObsolete() { return false; }
+        }, com.intellij.xdebugger.frame.XValuePlace.TREE);
+
+        try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
+        catch (InterruptedException ignored) {}
+
+        target.put("value", collected[0]);
+        target.put("type", collected[1]);
+        target.put("hasChildren", Boolean.parseBoolean(collected[2]));
+    }
+
+    /**
+     * POST /debug/evaluate — evaluate expression in the current debug session.
+     * Uses XDebuggerEvaluator.evaluate() with a sync callback.
+     */
     private Map<String, Object> evaluate(Map<String, Object> body) {
         String expr = (String) body.get("expression");
         if (expr == null) return errorMap("Missing 'expression'");
-        Map<String, Object> r = new LinkedHashMap<>();
-        r.put("expression", expr);
-        r.put("status", "submitted");
-        r.put("note", "Use Rider's Evaluate Expression (Alt+F8) for full evaluation");
-        return r;
+
+        Project project = getProject();
+        if (project == null) return errorMap("No project");
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("expression", expr);
+
+        runOnEdt(() -> {
+            XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
+            if (session == null) { result.put("error", "No debug session"); return; }
+            XStackFrame frame = session.getCurrentStackFrame();
+            if (frame == null) { result.put("error", "No stack frame"); return; }
+
+            com.intellij.xdebugger.evaluation.XDebuggerEvaluator evaluator = frame.getEvaluator();
+            if (evaluator == null) { result.put("error", "No evaluator available for this frame"); return; }
+
+            var latch = new java.util.concurrent.CountDownLatch(1);
+
+            try {
+                com.intellij.xdebugger.impl.breakpoints.XExpressionImpl expression =
+                    com.intellij.xdebugger.impl.breakpoints.XExpressionImpl.fromText(expr);
+
+                evaluator.evaluate(expression, new com.intellij.xdebugger.evaluation.XDebuggerEvaluator.XEvaluationCallback() {
+                    @Override
+                    public void evaluated(@NotNull com.intellij.xdebugger.frame.XValue xval) {
+                        collectXValuePresentation(xval, result);
+                        result.put("status", "evaluated");
+                        latch.countDown();
+                    }
+
+                    @Override
+                    public void errorOccurred(@NotNull String errorMessage) {
+                        result.put("error", errorMessage);
+                        result.put("status", "error");
+                        latch.countDown();
+                    }
+                }, null);
+            } catch (Exception e) {
+                result.put("error", "Evaluation failed: " + e.getMessage());
+                result.put("status", "error");
+                latch.countDown();
+            }
+
+            try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
+            catch (InterruptedException ignored) {}
+
+            if (!result.containsKey("status")) {
+                result.put("status", "timeout");
+                result.put("note", "Evaluation timed out after " + ASYNC_TIMEOUT_MS + "ms");
+            }
+        });
+        return result;
     }
 
+    /**
+     * GET /debug/stackTrace — enumerate ALL frames from XExecutionStack.
+     * Uses computeStackFrames() with a sync callback.
+     */
     private Map<String, Object> getStackTrace() {
         Project project = getProject();
         if (project == null) return Map.of("frames", List.of());
@@ -382,18 +565,98 @@ public class DebugBridgeHandler extends HttpRequestHandler {
         runOnEdt(() -> {
             XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
             if (session == null) { result.put("error", "No debug session"); return; }
-            XStackFrame frame = session.getCurrentStackFrame();
-            XSourcePosition pos = frame != null ? frame.getSourcePosition() : null;
-            if (pos != null) {
-                // Use source position file + line as method identifier
-                String method = pos.getFile().getName() + ":" + (pos.getLine() + 1);
-                result.put("frames", List.of(Map.of(
-                        "method", method, "file", pos.getFile().getName(), "line", pos.getLine() + 1)));
-            } else {
-                result.put("frames", List.of());
+
+            XSuspendContext ctx = session.getSuspendContext();
+            if (ctx == null) { result.put("error", "Not suspended"); return; }
+
+            XExecutionStack activeStack = ctx.getActiveExecutionStack();
+            if (activeStack == null) { result.put("error", "No active execution stack"); return; }
+
+            List<Map<String, Object>> frames = new ArrayList<>();
+            var latch = new java.util.concurrent.CountDownLatch(1);
+
+            // First add the top frame if available
+            XStackFrame topFrame = activeStack.getTopFrame();
+
+            activeStack.computeStackFrames(0, new XExecutionStack.XStackFrameContainer() {
+                @Override
+                public void addStackFrames(@NotNull List<? extends XStackFrame> stackFrames, boolean last) {
+                    for (XStackFrame sf : stackFrames) {
+                        Map<String, Object> frameInfo = new LinkedHashMap<>();
+                        XSourcePosition sfPos = sf.getSourcePosition();
+                        if (sfPos != null) {
+                            frameInfo.put("file", sfPos.getFile().getName());
+                            frameInfo.put("line", sfPos.getLine() + 1);
+                            frameInfo.put("filePath", sfPos.getFile().getPath());
+                        }
+
+                        // Try to get the function name from the custom name (via toString or presentation)
+                        String displayName = extractFrameDisplayName(sf);
+                        frameInfo.put("method", displayName);
+                        frameInfo.put("index", frames.size());
+
+                        frames.add(frameInfo);
+                    }
+                    if (last) latch.countDown();
+                }
+
+                @Override
+                public void errorOccurred(@NotNull String errorMessage) {
+                    frames.add(Map.of("error", errorMessage));
+                    latch.countDown();
+                }
+            });
+
+            try { latch.await(ASYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS); }
+            catch (InterruptedException ignored) {}
+
+            // If computeStackFrames returned nothing, at least include top frame
+            if (frames.isEmpty() && topFrame != null) {
+                XSourcePosition topPos = topFrame.getSourcePosition();
+                Map<String, Object> fallback = new LinkedHashMap<>();
+                if (topPos != null) {
+                    fallback.put("file", topPos.getFile().getName());
+                    fallback.put("line", topPos.getLine() + 1);
+                }
+                fallback.put("method", extractFrameDisplayName(topFrame));
+                fallback.put("index", 0);
+                frames.add(fallback);
             }
+
+            result.put("frames", frames);
+            result.put("threadName", activeStack.getDisplayName());
         });
         return result;
+    }
+
+    /**
+     * Extract a human-readable function name from a stack frame.
+     * Tries customizePresentation, then toString, then source position.
+     */
+    private static String extractFrameDisplayName(XStackFrame frame) {
+        // Try customizePresentation to get the text the UI shows
+        try {
+            var component = new com.intellij.ui.ColoredTextContainer() {
+                final StringBuilder sb = new StringBuilder();
+                @Override public void append(@NotNull String fragment, @NotNull com.intellij.ui.SimpleTextAttributes attributes) { sb.append(fragment); }
+                @Override public void setIcon(@org.jetbrains.annotations.Nullable javax.swing.Icon icon) {}
+                @Override public void setToolTipText(@org.jetbrains.annotations.Nullable String text) {}
+            };
+            frame.customizePresentation(component);
+            String name = component.sb.toString().trim();
+            if (!name.isEmpty()) return name;
+        } catch (Exception ignored) {}
+
+        // Fallback: toString
+        try {
+            String s = frame.toString();
+            if (s != null && !s.contains("@") && !s.isEmpty()) return s;
+        } catch (Exception ignored) {}
+
+        // Final fallback: file:line
+        XSourcePosition pos = frame.getSourcePosition();
+        if (pos != null) return pos.getFile().getName() + ":" + (pos.getLine() + 1);
+        return "unknown";
     }
 
     private Map<String, Object> getThreads() {
