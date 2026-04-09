@@ -2,15 +2,16 @@
 """One-click installer for the Rider Debug MCP Bridge plugin.
 
 Usage:
-    python install_plugin.py          # Auto-detect Rider and install
-    python install_plugin.py --build  # Build from source then install
+    python install_plugin.py
 
 What it does:
-    1. Finds your Rider plugins directory
-    2. Copies the pre-built plugin JAR (or builds it first with --build)
-    3. Tells you to restart Rider
+    1. Finds Rider installation (for JBR / JDK and IDE JARs)
+    2. Compiles the plugin Java source using Rider's bundled JDK
+    3. Packages into a proper plugin directory structure
+    4. Installs to Rider's plugins directory
+    5. Done — restart Rider
 
-That's it. No Gradle needed for normal installs.
+No Gradle, no external JDK, no downloads needed.
 """
 
 import os
@@ -18,193 +19,291 @@ import platform
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 PLUGIN_ID = "rider-debug-mcp-plugin"
 SCRIPT_DIR = Path(__file__).parent.resolve()
 PLUGIN_SRC = SCRIPT_DIR / "rider-plugin"
-PREBUILT_DIR = SCRIPT_DIR / "rider-plugin" / "prebuilt"
+JAVA_SRC = PLUGIN_SRC / "src" / "main" / "java"
+RESOURCES_DIR = PLUGIN_SRC / "src" / "main" / "resources"
 
 
-def find_rider_plugins_dir() -> Path | None:
-    """Find the Rider plugins directory for the current OS."""
+def find_rider_install_dir() -> Path | None:
+    """Find the Rider IDE installation directory."""
     system = platform.system()
 
     if system == "Windows":
-        appdata = os.environ.get("APPDATA", "")
-        if appdata:
-            base = Path(appdata) / "JetBrains"
-        else:
+        search_roots = [
+            Path("C:/Program Files/JetBrains"),
+            Path("C:/Program Files (x86)/JetBrains"),
+            Path.home() / "AppData" / "Local" / "JetBrains" / "Toolbox" / "apps",
+        ]
+    elif system == "Darwin":
+        search_roots = [
+            Path("/Applications"),
+            Path.home() / "Applications",
+        ]
+    else:
+        search_roots = [
+            Path.home() / ".local" / "share" / "JetBrains" / "Toolbox" / "apps",
+            Path("/opt/JetBrains"),
+            Path("/snap/rider/current"),
+        ]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        # Find directories matching Rider pattern
+        candidates = []
+        for d in root.iterdir():
+            name = d.name.lower()
+            if d.is_dir() and "rider" in name:
+                # Check for jbr inside
+                if (d / "jbr" / "bin").exists():
+                    candidates.append(d)
+                # Toolbox nested structure
+                for sub in d.iterdir():
+                    if sub.is_dir() and (sub / "jbr" / "bin").exists():
+                        candidates.append(sub)
+
+        if candidates:
+            candidates.sort(key=lambda d: d.name, reverse=True)
+            return candidates[0]
+
+    return None
+
+
+def find_rider_plugins_dir() -> Path | None:
+    """Find the Rider user plugins directory."""
+    system = platform.system()
+
+    if system == "Windows":
+        base = Path(os.environ.get("APPDATA", "")) / "JetBrains"
+        if not base.exists():
             base = Path.home() / "AppData" / "Roaming" / "JetBrains"
     elif system == "Darwin":
         base = Path.home() / "Library" / "Application Support" / "JetBrains"
-    else:  # Linux
+    else:
         base = Path.home() / ".local" / "share" / "JetBrains"
 
     if not base.exists():
         return None
 
-    # Find Rider directories, sorted newest first
     rider_dirs = sorted(
         [d for d in base.iterdir() if d.is_dir() and d.name.startswith("Rider")],
-        key=lambda d: d.name,
-        reverse=True,
+        key=lambda d: d.name, reverse=True,
     )
-
     if not rider_dirs:
         return None
 
     plugins_dir = rider_dirs[0] / "plugins"
     plugins_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  Found Rider config: {rider_dirs[0].name}")
+    print(f"  Rider config: {rider_dirs[0].name}")
     return plugins_dir
 
 
-def find_prebuilt_jar() -> Path | None:
-    """Find a pre-built plugin JAR."""
-    if PREBUILT_DIR.exists():
-        jars = list(PREBUILT_DIR.glob("*.jar"))
-        if jars:
-            return jars[0]
-
-    # Also check build output
-    dist_dir = PLUGIN_SRC / "build" / "distributions"
-    if dist_dir.exists():
-        zips = list(dist_dir.glob("*.zip"))
-        if zips:
-            return zips[0]
-
-    return None
+def find_jbr_javac(rider_dir: Path) -> Path | None:
+    """Find javac in Rider's bundled JBR."""
+    ext = ".exe" if platform.system() == "Windows" else ""
+    javac = rider_dir / "jbr" / "bin" / f"javac{ext}"
+    if javac.exists():
+        return javac
+    # Some distributions
+    javac = rider_dir / "jbr" / "bin" / f"javac{ext}"
+    return javac if javac.exists() else None
 
 
-def build_plugin() -> Path | None:
-    """Build the plugin from source using Gradle."""
-    print("\n📦 Building plugin from source...")
+def find_ide_classpath(rider_dir: Path) -> list[Path]:
+    """Collect the JARs needed to compile against IntelliJ Platform APIs."""
+    lib_dir = rider_dir / "lib"
+    needed_patterns = [
+        "platform-api*", "platform-impl*", "util*",
+        "app*", "openapi*", "extensions*",
+        "netty-*", "gson-*", "kotlin-stdlib*",
+        "jps-model*", "xdebugger-api*", "xdebugger-impl*",
+        "execution-*", "indexing-api*",
+    ]
+    jars = []
 
-    if not (PLUGIN_SRC / "build.gradle.kts").exists():
-        print("  ❌ rider-plugin/build.gradle.kts not found!")
-        return None
+    if lib_dir.exists():
+        for jar in lib_dir.glob("*.jar"):
+            jars.append(jar)
 
-    # Check for Gradle wrapper or system Gradle
-    gradlew = PLUGIN_SRC / ("gradlew.bat" if platform.system() == "Windows" else "gradlew")
-    if gradlew.exists():
-        cmd = [str(gradlew), "buildPlugin"]
-    else:
-        cmd = ["gradle", "buildPlugin"]
+    # Also add modules dir
+    modules_dir = rider_dir / "lib" / "modules"
+    if modules_dir.exists():
+        for jar in modules_dir.glob("*.jar"):
+            jars.append(jar)
 
+    # Plugins dir for xdebugger
+    plugins_dir = rider_dir / "plugins"
+    if plugins_dir.exists():
+        for jar in plugins_dir.rglob("*.jar"):
+            jars.append(jar)
+
+    return jars
+
+
+def compile_java(javac: Path, jars: list[Path], src_dir: Path, out_dir: Path) -> bool:
+    """Compile Java source files using the found javac.
+
+    Uses @argfile to avoid Windows command line length limits.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    java_files = list(src_dir.rglob("*.java"))
+    if not java_files:
+        print("  ❌ No .java source files found!")
+        return False
+
+    classpath = os.pathsep.join(str(j) for j in jars)
+
+    # Write args to a temp file to avoid Windows 32k char limit
+    argfile = PLUGIN_SRC / "build" / "_javac_args.txt"
+    argfile.parent.mkdir(parents=True, exist_ok=True)
+    # javac @argfile treats backslashes as escape chars, so use forward slashes
+    def fwd(p: Path | str) -> str:
+        return str(p).replace("\\", "/")
+
+    with open(argfile, "w", encoding="utf-8") as f:
+        f.write(f'-d\n"{fwd(out_dir)}"\n')
+        f.write(f'-cp\n"{fwd(classpath)}"\n')
+        f.write("-source\n17\n")
+        f.write("-target\n17\n")
+        f.write("-encoding\nUTF-8\n")
+        f.write("-nowarn\n")
+        for jf in java_files:
+            f.write(f'"{fwd(jf)}"\n')
+
+    cmd = [str(javac), f"@{argfile}"]
+
+    print(f"  Compiling {len(java_files)} source file(s)...")
+    result = subprocess.run(cmd, capture_output=True, timeout=120)
+
+    # Cleanup argfile
     try:
-        result = subprocess.run(
-            cmd, cwd=str(PLUGIN_SRC), capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            print(f"  ❌ Build failed:\n{result.stderr[:500]}")
-            return None
-    except FileNotFoundError:
-        print("  ❌ Gradle not found. Install Gradle or use the Gradle wrapper.")
-        print("     Run: cd rider-plugin && gradle wrapper")
-        return None
-    except subprocess.TimeoutExpired:
-        print("  ❌ Build timed out (5 min)")
-        return None
+        argfile.unlink()
+    except OSError:
+        pass
 
-    dist_dir = PLUGIN_SRC / "build" / "distributions"
-    zips = list(dist_dir.glob("*.zip"))
-    if zips:
-        print(f"  ✅ Built: {zips[0].name}")
-        return zips[0]
-
-    # Try lib dir for JAR
-    lib_dir = PLUGIN_SRC / "build" / "libs"
-    jars = list(lib_dir.glob("*.jar"))
-    if jars:
-        print(f"  ✅ Built: {jars[0].name}")
-        return jars[0]
-
-    print("  ❌ Build succeeded but no output found")
-    return None
-
-
-def install_plugin(artifact: Path, plugins_dir: Path) -> bool:
-    """Install the plugin artifact to the Rider plugins directory."""
-    target = plugins_dir / PLUGIN_ID
-
-    # Clean old install
-    if target.exists():
-        print(f"  Removing old installation...")
-        shutil.rmtree(target)
-
-    if artifact.suffix == ".zip":
-        print(f"  Extracting {artifact.name}...")
-        shutil.unpack_archive(str(artifact), str(plugins_dir))
-        # Rename extracted dir if needed
-        extracted = [d for d in plugins_dir.iterdir() if d.is_dir() and d.name != PLUGIN_ID and "rider-debug" in d.name.lower()]
-        if extracted:
-            extracted[0].rename(target)
-    elif artifact.suffix == ".jar":
-        target.mkdir(parents=True, exist_ok=True)
-        lib_dir = target / "lib"
-        lib_dir.mkdir(exist_ok=True)
-        shutil.copy2(str(artifact), str(lib_dir / artifact.name))
-    else:
-        print(f"  ❌ Unknown artifact type: {artifact.suffix}")
+    if result.returncode != 0:
+        print("  ❌ Compilation failed:")
+        stderr = ""
+        for encoding in ("utf-8", "gbk", "cp1252", "latin-1"):
+            try:
+                stderr = result.stderr.decode(encoding) if result.stderr else ""
+                break
+            except (UnicodeDecodeError, AttributeError):
+                continue
+        stdout = ""
+        for encoding in ("utf-8", "gbk", "cp1252", "latin-1"):
+            try:
+                stdout = result.stdout.decode(encoding) if result.stdout else ""
+                break
+            except (UnicodeDecodeError, AttributeError):
+                continue
+        if stderr:
+            print(stderr[:2000])
+        if stdout:
+            print(stdout[:2000])
         return False
 
     return True
 
 
-def main():
-    build_first = "--build" in sys.argv
+def package_plugin(out_dir: Path, resources_dir: Path, target_dir: Path) -> Path:
+    """Package compiled classes + resources into plugin directory structure."""
+    plugin_dir = target_dir / PLUGIN_ID
+    if plugin_dir.exists():
+        shutil.rmtree(plugin_dir)
 
+    lib_dir = plugin_dir / "lib"
+    lib_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create JAR
+    jar_path = lib_dir / f"{PLUGIN_ID}.jar"
+    with zipfile.ZipFile(str(jar_path), "w", zipfile.ZIP_DEFLATED) as zf:
+        # Add compiled classes
+        for class_file in out_dir.rglob("*.class"):
+            arcname = class_file.relative_to(out_dir).as_posix()
+            zf.write(str(class_file), arcname)
+
+        # Add resources (plugin.xml etc)
+        if resources_dir.exists():
+            for res in resources_dir.rglob("*"):
+                if res.is_file():
+                    arcname = res.relative_to(resources_dir).as_posix()
+                    zf.write(str(res), arcname)
+
+    return plugin_dir
+
+
+def main():
     print("🔌 Rider Debug MCP Plugin Installer")
     print("=" * 40)
 
-    # Step 1: Find Rider
-    print("\n🔍 Finding Rider installation...")
+    # Step 1: Find Rider IDE installation
+    print("\n🔍 Finding Rider IDE installation...")
+    rider_dir = find_rider_install_dir()
+    if not rider_dir:
+        print("  ❌ Rider IDE not found!")
+        print("     Install JetBrains Rider and try again.")
+        sys.exit(1)
+    print(f"  ✅ Rider: {rider_dir.name}")
+
+    # Step 2: Find JBR javac
+    print("\n🔍 Finding Rider's bundled JDK...")
+    javac = find_jbr_javac(rider_dir)
+    if not javac:
+        print("  ❌ javac not found in Rider's JBR!")
+        sys.exit(1)
+    print(f"  ✅ javac: {javac}")
+
+    # Step 3: Find plugins dir
+    print("\n🔍 Finding Rider plugins directory...")
     plugins_dir = find_rider_plugins_dir()
     if not plugins_dir:
-        print("  ❌ Rider not found! Please install JetBrains Rider first.")
-        print("     Or manually install the plugin:")
-        print("     Rider → Settings → Plugins → ⚙ → Install from Disk")
+        print("  ❌ Rider config directory not found!")
         sys.exit(1)
-    print(f"  📁 Plugins dir: {plugins_dir}")
+    print(f"  📁 Plugins: {plugins_dir}")
 
-    # Step 2: Get the plugin artifact
-    artifact = None
-    if build_first:
-        artifact = build_plugin()
-    else:
-        artifact = find_prebuilt_jar()
-        if not artifact:
-            print("\n📦 No pre-built plugin found, building from source...")
-            artifact = build_plugin()
-
-    if not artifact:
-        print("\n❌ Could not get plugin artifact.")
-        print("   Try building manually:")
-        print("     cd rider-plugin")
-        print("     gradle buildPlugin")
-        print("   Then run this script again.")
+    # Step 4: Check source exists
+    if not JAVA_SRC.exists():
+        print(f"\n  ❌ Java source not found at {JAVA_SRC}")
         sys.exit(1)
 
-    # Step 3: Install
-    print(f"\n📥 Installing plugin...")
-    if install_plugin(artifact, plugins_dir):
-        print(f"  ✅ Installed to: {plugins_dir / PLUGIN_ID}")
-    else:
-        print("  ❌ Installation failed")
-        sys.exit(1)
+    # Step 5: Collect classpath
+    print("\n📚 Collecting IDE libraries...")
+    jars = find_ide_classpath(rider_dir)
+    print(f"  Found {len(jars)} JARs in classpath")
 
-    # Step 4: Done!
+    # Step 6: Compile
+    print("\n🔨 Compiling plugin...")
+    build_dir = PLUGIN_SRC / "build" / "classes"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+
+    if not compile_java(javac, jars, JAVA_SRC, build_dir):
+        print("\n❌ Build failed. Check source code for errors.")
+        sys.exit(1)
+    print("  ✅ Compiled successfully")
+
+    # Step 7: Package & install
+    print("\n� Packaging and installing...")
+    plugin_dir = package_plugin(build_dir, RESOURCES_DIR, plugins_dir)
+    print(f"  ✅ Installed to: {plugin_dir}")
+
+    # Done
     print("\n" + "=" * 40)
     print("✅ Installation complete!")
-    print("")
+    print()
     print("👉 Next steps:")
     print("   1. Restart Rider")
     print("   2. The plugin auto-activates (no config needed)")
     print("   3. Run: python -m rider_debug_mcp")
-    print("")
-    print("   To verify: open http://localhost:63342/api/rider-debug-mcp/status")
-    print("   in your browser after restarting Rider.")
+    print()
+    print("   Verify: http://localhost:63342/api/rider-debug-mcp/status")
 
 
 if __name__ == "__main__":
