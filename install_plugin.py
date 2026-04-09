@@ -74,6 +74,23 @@ def find_rider_install_dir() -> Path | None:
     return None
 
 
+def _detect_running_rider_version() -> str | None:
+    """Try to detect the running Rider version via /api/about."""
+    import json
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://localhost:63342/api/about", timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+            name = data.get("name", "")  # "Rider 2025.1.4"
+            # Extract "2025.1" from "Rider 2025.1.4"
+            parts = name.replace("Rider", "").strip().split(".")
+            if len(parts) >= 2:
+                return f"{parts[0]}.{parts[1]}"
+    except Exception:
+        pass
+    return None
+
+
 def find_rider_plugins_dir() -> Path | None:
     """Find the Rider user plugins directory."""
     system = platform.system()
@@ -91,11 +108,22 @@ def find_rider_plugins_dir() -> Path | None:
         return None
 
     rider_dirs = sorted(
-        [d for d in base.iterdir() if d.is_dir() and d.name.startswith("Rider")],
+        [d for d in base.iterdir() if d.is_dir() and d.name.startswith("Rider") and not d.name == "Rider"],
         key=lambda d: d.name, reverse=True,
     )
     if not rider_dirs:
         return None
+
+    # Try to match with running Rider version via /api/about
+    running_version = _detect_running_rider_version()
+    if running_version:
+        for d in rider_dirs:
+            # Rider2025.1 matches baselineVersion 251
+            if running_version in d.name:
+                print(f"  Matched running Rider {running_version} → {d.name}")
+                plugins_dir = d / "plugins"
+                plugins_dir.mkdir(parents=True, exist_ok=True)
+                return plugins_dir
 
     plugins_dir = rider_dirs[0] / "plugins"
     plugins_dir.mkdir(parents=True, exist_ok=True)
